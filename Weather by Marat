@@ -1,135 +1,192 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "io/ioutil"
-    "log"
-    "net/http"
-    "net/url"   
-    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-func getCoordinatesNominatim(city string) (string, string, string, error) {
-    encodedCity := url.QueryEscape(city)
-    urlStr := fmt.Sprintf("https://nominatim.openstreetmap.org/search?format=json&q=%s", encodedCity)
-    req, _ := http.NewRequest("GET", urlStr, nil)
-    req.Header.Set("User-Agent", "weather-telegram-bot")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return "", "", "", err
-    }
-    defer resp.Body.Close()
-    body, _ := ioutil.ReadAll(resp.Body)
-    var data []map[string]interface{}
-    if err := json.Unmarshal(body, &data); err != nil {
-        return "", "", "", err
-    }
-    if len(data) == 0 {
-        return "", "", "", fmt.Errorf("Город не найден")
-    }
-    lat := data[0]["lat"].(string)
-    lon := data[0]["lon"].(string)
-    displayName := data[0]["display_name"].(string)
-    return lat, lon, displayName, nil
+const (
+	nominatimURL = "https://nominatim.openstreetmap.org/search"
+	openMeteoURL = "https://api.open-meteo.com/v1/forecast"
+	userAgent    = "weather-telegram-bot/1.0"
+)
+
+type nominatimResponse []struct {
+	DisplayName string `json:"display_name"`
+	Lat         string `json:"lat"`
+	Lon         string `json:"lon"`
 }
 
-func getWeatherOpenMeteo(lat, lon string) (string, error) {
-    url := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current_weather=true", lat, lon)
-    resp, err := http.Get(url)
-    if err != nil {
-        return "", err
-    }
-    defer resp.Body.Close()
-    body, _ := ioutil.ReadAll(resp.Body)
-    var data map[string]interface{}
-    if err := json.Unmarshal(body, &data); err != nil {
-        return "", err
-    }
-    current, ok := data["current_weather"].(map[string]interface{})
-    if !ok {
-        return "", fmt.Errorf("Ошибка разбора данных о погоде")
-    }
-    temp, ok := current["temperature"].(float64)
-    if !ok {
-        return "", fmt.Errorf("Ошибка разбора температуры")
-    }
-    wind, _ := current["windspeed"].(float64)
-    weatherCode := int(current["weathercode"].(float64))
-    description := weatherCodeToDescription(weatherCode)
-    return fmt.Sprintf("Сейчас %.0f°C, %s, ветер %.0f м/с.", temp, description, wind), nil
+type weatherResponse struct {
+	CurrentWeather struct {
+		Temperature float64 `json:"temperature"`
+		WeatherCode int     `json:"weathercode"`
+		WindSpeed   float64 `json:"windspeed"`
+	} `json:"current_weather"`
+}
+
+func getCoordinatesNominatim(ctx context.Context, client *http.Client, city string) (string, string, string, error) {
+	encodedCity := url.QueryEscape(city)
+	urlStr := fmt.Sprintf("%s?format=json&q=%s", nominatimURL, encodedCity)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return "", "", "", fmt.Errorf("build nominatim request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", "", fmt.Errorf("request nominatim: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", fmt.Errorf("nominatim returned status %d", resp.StatusCode)
+	}
+
+	var data nominatimResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", "", "", fmt.Errorf("decode nominatim response: %w", err)
+	}
+
+	if len(data) == 0 {
+		return "", "", "", fmt.Errorf("город не найден")
+	}
+
+	return data[0].Lat, data[0].Lon, data[0].DisplayName, nil
+}
+
+func getWeatherOpenMeteo(ctx context.Context, client *http.Client, lat, lon string) (string, error) {
+	urlStr := fmt.Sprintf("%s?latitude=%s&longitude=%s&current_weather=true", openMeteoURL, lat, lon)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return "", fmt.Errorf("build open-meteo request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request open-meteo: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("open-meteo returned status %d", resp.StatusCode)
+	}
+
+	var data weatherResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", fmt.Errorf("decode open-meteo response: %w", err)
+	}
+
+	weather := data.CurrentWeather
+	description := weatherCodeToDescription(weather.WeatherCode)
+
+	return fmt.Sprintf("Сейчас %.0f°C, %s, ветер %.0f м/с.", weather.Temperature, description, weather.WindSpeed), nil
 }
 
 func weatherCodeToDescription(code int) string {
-    switch code {
-    case 0:
-        return "ясно"
-    case 1, 2, 3:
-        return "переменная облачность"
-    case 45, 48:
-        return "туман"
-    case 51, 53, 55, 56, 57:
-        return "морось"
-    case 61, 63, 65, 66, 67:
-        return "дождь"
-    case 71, 73, 75, 77:
-        return "снег"
-    case 80, 81, 82:
-        return "ливень"
-    case 85, 86:
-        return "снегопад"
-    case 95:
-        return "гроза"
-    case 96, 99:
-        return "гроза с градом"
-    default:
-        return "неизвестная погода"
-    }
+	switch code {
+	case 0:
+		return "ясно"
+	case 1, 2, 3:
+		return "переменная облачность"
+	case 45, 48:
+		return "туман"
+	case 51, 53, 55, 56, 57:
+		return "морось"
+	case 61, 63, 65, 66, 67:
+		return "дождь"
+	case 71, 73, 75, 77:
+		return "снег"
+	case 80, 81, 82:
+		return "ливень"
+	case 85, 86:
+		return "снегопад"
+	case 95:
+		return "гроза"
+	case 96, 99:
+		return "гроза с градом"
+	default:
+		return "неизвестная погода"
+	}
 }
 
 func main() {
-    botToken := "tgbottoken"
+	botToken := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	if botToken == "" {
+		log.Fatal("environment variable BOT_TOKEN is required")
+	}
 
-    bot, err := tgbotapi.NewBotAPI(botToken)
-    if err != nil {
-        log.Panic(err)
-    }
+	bot, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		log.Panicf("create bot: %v", err)
+	}
 
-    bot.Debug = true
-    log.Printf("Authorized on account %s", bot.Self.UserName)
+	bot.Debug = true
+	log.Printf("Authorized on account %s", bot.Self.UserName)
 
-    u := tgbotapi.NewUpdate(0)
-    u.Timeout = 60
+	updates := bot.GetUpdatesChan(tgbotapi.UpdateConfig{Timeout: 60})
+	httpClient := &http.Client{Timeout: 10 * time.Second}
 
-    updates := bot.GetUpdatesChan(u)
+	for update := range updates {
+		if update.Message == nil || update.Message.Text == "" {
+			continue
+		}
 
-    for update := range updates {
-        if update.Message != nil {
-            city := update.Message.Text
+		chatID := update.Message.Chat.ID
 
-        if city == "/start" {
-            msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Введите город, чтобы узнать погоду.")
-            bot.Send(msg)
-            continue
-        }
+		if update.Message.IsCommand() {
+			switch update.Message.Command() {
+			case "start":
+				sendMessage(bot, chatID, "Введите город, чтобы узнать погоду.")
+			default:
+				sendMessage(bot, chatID, "Команда не поддерживается. Просто отправьте название города.")
+			}
+			continue
+		}
 
-            lat, lon, displayName, err := getCoordinatesNominatim(city)
-            if err != nil {
-                msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Не могу найти такой город :(")
-                bot.Send(msg)
-                continue
-            }
+		city := strings.TrimSpace(update.Message.Text)
+		if city == "" {
+			sendMessage(bot, chatID, "Пожалуйста, укажите город.")
+			continue
+		}
 
-            weather, err := getWeatherOpenMeteo(lat, lon)
-            if err != nil {
-                msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при получении погоды :(")
-                bot.Send(msg)
-                continue
-            }
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		lat, lon, displayName, err := getCoordinatesNominatim(ctx, httpClient, city)
+		cancel()
+		if err != nil {
+			log.Printf("failed to find city %q: %v", city, err)
+			sendMessage(bot, chatID, "Не могу найти такой город :(")
+			continue
+		}
 
-            msg := tgbotapi.NewMessage(update.Message.Chat.ID,
-                fmt.Sprintf("Погода для: %s\n%s", displayName, weather))
-            bot.Send(msg)
-        }
-    }
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		weather, err := getWeatherOpenMeteo(ctx, httpClient, lat, lon)
+		cancel()
+		if err != nil {
+			log.Printf("failed to fetch weather for %s (%s,%s): %v", displayName, lat, lon, err)
+			sendMessage(bot, chatID, "Ошибка при получении погоды :(")
+			continue
+		}
+
+		sendMessage(bot, chatID, fmt.Sprintf("Погода для: %s\n%s", displayName, weather))
+	}
+}
+
+func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+		log.Printf("failed to send message: %v", err)
+	}
 }
